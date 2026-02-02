@@ -758,6 +758,11 @@ static float fogOverrideBlend = 0.0f;
 static uint8_t currentFogR = 0, currentFogG = 0, currentFogB = 0;
 static float currentFogNear = 0.0f, currentFogFar = 0.0f;
 
+// Background color lerping (follows fog color for smooth transitions)
+static float bgLerpR = 0.0f, bgLerpG = 0.0f, bgLerpB = 0.0f;
+static bool bgLerpInitialized = false;
+#define BG_LERP_SPEED 2.0f  // Same speed as fog color lerp
+
 void game_get_current_fog(uint8_t* fogR, uint8_t* fogG, uint8_t* fogB, float* fogNear, float* fogFar) {
     *fogR = currentFogR;
     *fogG = currentFogG;
@@ -778,6 +783,7 @@ void game_set_fog_override(uint8_t fogR, uint8_t fogG, uint8_t fogB, float fogNe
 
 void game_clear_fog_override(void) {
     fogOverrideActive = false;
+    bgLerpInitialized = false;  // Reset background lerp on level change
 }
 
 // Arms mode state - NOW IN PLAYER STRUCT VIA MACRO BRIDGE
@@ -4617,6 +4623,9 @@ static void update_celebration(float deltaTime) {
             maploader_free(&mapLoader);
             collision_loader_free_all();  // Free collision meshes to prevent stale pointer reuse
             // (level3_special removed - using DECO_LEVEL3_STREAM instead)
+
+            // Clear fog override so new level starts with its default fog
+            game_clear_fog_override();
 
             // Reload for new level
             maploader_init(&mapLoader, FB_COUNT, VISIBILITY_RANGE);
@@ -9855,6 +9864,9 @@ void update_game_scene(void) {
                 level_load(currentLevel, &mapLoader, &mapRuntime);
                 mapRuntime.mapLoader = &mapLoader;  // Set collision reference for turret raycasts
 
+                // Clear fog override so level starts with default fog
+                game_clear_fog_override();
+
                 // Restore checkpoint lighting (if any) or reinitialize from level
                 if (lightingState.hasCheckpointLighting) {
                     restore_checkpoint_lighting();
@@ -10119,9 +10131,43 @@ void draw_game_scene(void) {
     surface_t *disp = display_get();
     surface_t *zbuf = display_get_zbuf();
     rdpq_attach(disp, zbuf);
-    // Use per-level background color
-    uint8_t bgR, bgG, bgB;
-    level_get_bg_color(currentLevel, &bgR, &bgG, &bgB);
+
+    // Background color with smooth lerping toward fog color
+    // Target is fog override color when active, otherwise level background
+    uint8_t levelBgR, levelBgG, levelBgB;
+    level_get_bg_color(currentLevel, &levelBgR, &levelBgG, &levelBgB);
+
+    float targetBgR, targetBgG, targetBgB;
+    if (fogOverrideActive) {
+        // Lerp toward fog color when fog trigger is active
+        targetBgR = fogOverrideR;
+        targetBgG = fogOverrideG;
+        targetBgB = fogOverrideB;
+    } else {
+        // Lerp toward level default background
+        targetBgR = levelBgR;
+        targetBgG = levelBgG;
+        targetBgB = levelBgB;
+    }
+
+    // Initialize lerp on first frame or after level change
+    if (!bgLerpInitialized) {
+        bgLerpR = levelBgR;
+        bgLerpG = levelBgG;
+        bgLerpB = levelBgB;
+        bgLerpInitialized = true;
+    }
+
+    // Smooth lerp toward target
+    float lerpSpeed = BG_LERP_SPEED * DELTA_TIME;
+    bgLerpR += (targetBgR - bgLerpR) * lerpSpeed;
+    bgLerpG += (targetBgG - bgLerpG) * lerpSpeed;
+    bgLerpB += (targetBgB - bgLerpB) * lerpSpeed;
+
+    // Clamp and use lerped background color
+    uint8_t bgR = (uint8_t)(bgLerpR < 0 ? 0 : (bgLerpR > 255 ? 255 : bgLerpR));
+    uint8_t bgG = (uint8_t)(bgLerpG < 0 ? 0 : (bgLerpG > 255 ? 255 : bgLerpG));
+    uint8_t bgB = (uint8_t)(bgLerpB < 0 ? 0 : (bgLerpB > 255 ? 255 : bgLerpB));
     rdpq_clear(RGBA32(bgR, bgG, bgB, 0xFF));
     rdpq_clear_z(0xFFFC);
 

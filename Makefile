@@ -10,7 +10,7 @@ include $(N64_INST)/include/t3d.mk
 # -------------------------
 # Project settings
 # -------------------------
-N64_ROM_TITLE := "N64BrewJam"
+N64_ROM_TITLE := "BotBoy64"
 N64_ROM_SAVETYPE := eeprom4k
 
 # -------------------------
@@ -153,7 +153,7 @@ assets_conv := \
 # -------------------------
 # Use recursive make so assets are re-scanned after codegen
 all: codegen
-	@$(MAKE) --no-print-directory game.z64
+	@$(MAKE) --no-print-directory BotBoy64.z64
 
 # -------------------------
 # Auto-generate code (collision registry, level registry)
@@ -348,13 +348,9 @@ filesystem/%.col: assets/%.col
 # -------------------------
 # DFS filesystem
 # -------------------------
-$(BUILD_DIR)/game.dfs: $(assets_conv)
+$(BUILD_DIR)/BotBoy64.dfs: $(assets_conv)
 
-$(BUILD_DIR)/game.elf: $(OBJS)
-
-# Override ROM title
-game.z64: N64_ROM_TITLE="N64BrewJam Game"
-game.z64: $(BUILD_DIR)/game.dfs
+$(BUILD_DIR)/BotBoy64.elf: $(OBJS)
 
 # -------------------------
 # Dependency includes
@@ -365,7 +361,7 @@ game.z64: $(BUILD_DIR)/game.dfs
 # Clean
 # -------------------------
 clean:
-	rm -rf $(BUILD_DIR) game.z64
+	rm -rf $(BUILD_DIR) BotBoy64.z64
 	rm -rf filesystem
 
 .PHONY: all clean

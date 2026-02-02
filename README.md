@@ -5,7 +5,7 @@
 
 # BotBoy!64
 
-A 3D platformer for the Nintendo 64, created for N64brew Game Jam 2025. Best played in Ares emulator, then real hardware, in that order. 
+A 3D platformer for the Nintendo 64, created for N64brew Game Jam 2025.
 
 ## Story
 

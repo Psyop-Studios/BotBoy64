@@ -100,10 +100,10 @@ static const LevelData LEVEL_6_DATA = {
 { DECO_BOLT, -2598.4f, 414.4f, -272.2f, -0.00f, 1.00f, 1.00f, 1.00f },
 { DECO_BOLT, -1825.0f, 758.9f, -169.3f, -0.00f, 1.00f, 1.00f, 1.00f },
 { DECO_LIGHT_TRIGGER, -1642.1f, 638.7f, 47.1f, -0.00f, 11.90f, 11.90f, 11.90f, .checkpointAmbientR = 131, .checkpointAmbientG = 71, .checkpointAmbientB = 40, .checkpointDirectionalR = 44, .checkpointDirectionalG = 90, .checkpointDirectionalB = 113, .lightTriggerDirX = 0.00f, .lightTriggerDirY = 1.00f, .lightTriggerDirZ = -1.00f },
-{ DECO_FOGCOLOR, -1011.6f, 638.7f, -4.7f, -0.00f, 1.83f, 3.74f, 6.57f, .fogColorR = 10, .fogColorG = 31, .fogColorB = 55, .fogNear = 850.0f, .fogFar = 1000.0f },
-{ DECO_FOGCOLOR, -2289.7f, 638.7f, -4.7f, -0.00f, 1.83f, 3.74f, 6.57f, .fogColorR = 10, .fogColorG = 31, .fogColorB = 55, .fogNear = 850.0f, .fogFar = 1000.0f },
-{ DECO_FOGCOLOR, -827.7f, 638.7f, -4.7f, -0.00f, 1.83f, 3.74f, 6.57f, .fogColorR = 241, .fogColorG = 38, .fogColorB = 8, .fogNear = 820.0f, .fogFar = 1000.0f },
-{ DECO_FOGCOLOR, -2442.0f, 638.7f, -4.7f, -0.00f, 1.83f, 3.74f, 6.57f, .fogColorR = 241, .fogColorG = 38, .fogColorB = 8, .fogNear = 820.0f, .fogFar = 1000.0f },
+{ DECO_FOGCOLOR, -1011.6f, 638.7f, -4.7f, -0.00f, 1.83f, 3.74f, 6.57f, .fogColorR = 10, .fogColorG = 31, .fogColorB = 55 },
+{ DECO_FOGCOLOR, -2289.7f, 638.7f, -4.7f, -0.00f, 1.83f, 3.74f, 6.57f, .fogColorR = 10, .fogColorG = 31, .fogColorB = 55 },
+{ DECO_FOGCOLOR, -827.7f, 638.7f, -4.7f, -0.00f, 1.83f, 3.74f, 6.57f, .fogColorR = 241, .fogColorG = 38, .fogColorB = 8},
+{ DECO_FOGCOLOR, -2442.0f, 638.7f, -4.7f, -0.00f, 1.83f, 3.74f, 6.57f, .fogColorR = 241, .fogColorG = 38, .fogColorB = 8},
 { DECO_TURRET, 660.1f, 600.5f, 135.5f, -0.00f, 1.00f, 1.00f, 1.00f },
 
 
