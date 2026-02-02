@@ -1,3 +1,12 @@
+
+  ![BotBoy!64](assets/banner.png)
+
+  Or for more control over sizing, use HTML:
+
+  <p align="center">
+    <img src="assets/banner.png" alt="BotBoy!64" width="100%">
+  </p>
+
 # BotBoy!64
 
 A 3D platformer for the Nintendo 64, created for N64brew Game Jam 2025.
