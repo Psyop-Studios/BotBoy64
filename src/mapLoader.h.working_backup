@@ -1,0 +1,694 @@
+#ifndef MAP_LOADER_H
+#define MAP_LOADER_H
+
+#include <libdragon.h>
+#include <t3d/t3d.h>
+#include <t3d/t3dmodel.h>
+#include "collision.h"
+#include "collision_registry.h"
+#include <stdbool.h>
+#include <string.h>
+#include <math.h>
+
+#define MAX_MAP_SEGMENTS 32
+#define MAX_CACHED_MODELS 16
+#define MAX_COLLISION_CHUNKS 8  // Max collision chunks per segment
+
+// Simplified definition - just specify the model path
+// Collision is auto-looked up, scale defaults to 1.0
+typedef struct {
+    const char* modelPath;           // ROM path (e.g., "rom:/test_map.t3dm")
+    float scaleX, scaleY, scaleZ;    // Scale (default 1.0)
+} MapSegmentDef;
+
+// Model cache entry
+typedef struct {
+    const char* path;
+    T3DModel* model;
+} CachedModel;
+
+// Runtime map segment
+typedef struct {
+    T3DModel* model;
+    CollisionMesh* collision;           // Single collision (if not chunked)
+    CollisionMesh* collisionChunks[MAX_COLLISION_CHUNKS];  // Chunked collision
+    int collisionChunkCount;            // 0 = use single collision, >0 = use chunks
+    float posX, posY, posZ;
+    float scaleX, scaleY, scaleZ;
+    float rotY;  // Extra Y rotation in radians (added to base 90 degrees)
+    float collisionOffX, collisionOffZ;  // Collision offset (may differ from posX/Z for chunks)
+    float collisionScaleX, collisionScaleZ;  // Collision scale (may differ from scaleX/Z for chunks)
+    float width;
+    float extentMin, extentMax;  // X extent after rotation (from model's Z AABB)
+    // World-space X bounds for visibility culling (computed from collision data after rotation)
+    float worldMinX, worldMaxX;
+    bool isChunk;  // True if this segment is a chunk (has baked transforms)
+    bool active;
+    bool loaded;
+} MapSegment;
+
+// Map loader state
+typedef struct {
+    MapSegment segments[MAX_MAP_SEGMENTS];
+    int count;
+    float visibilityRange;
+    T3DMat4FP* matrixFP;
+    int fbCount;
+
+    // Model cache to avoid duplicate loads
+    CachedModel modelCache[MAX_CACHED_MODELS];
+    int cacheCount;
+
+    // Level-specific extra rotation (for collision - visuals handle separately)
+    // This is set from LevelData.mapRotY and used by collision rebuild
+    float mapRotY;
+} MapLoader;
+
+// ============================================================
+// MODEL CACHING
+// ============================================================
+
+static inline T3DModel* maploader_get_cached_model(MapLoader* loader, const char* path) {
+    // Check if already loaded
+    for (int i = 0; i < loader->cacheCount; i++) {
+        if (strcmp(loader->modelCache[i].path, path) == 0) {
+            return loader->modelCache[i].model;
+        }
+    }
+
+    // Load new model
+    if (loader->cacheCount >= MAX_CACHED_MODELS) {
+        debugf("MapLoader: Model cache full!\n");
+        return NULL;
+    }
+
+    T3DModel* model = t3d_model_load(path);
+    if (model) {
+        loader->modelCache[loader->cacheCount].path = path;
+        loader->modelCache[loader->cacheCount].model = model;
+        loader->cacheCount++;
+        debugf("MapLoader: Loaded model %s\n", path);
+    }
+    return model;
+}
+
+// ============================================================
+// CORE FUNCTIONS
+// ============================================================
+
+static inline void maploader_init(MapLoader* loader, int fbCount, float visibilityRange) {
+    loader->count = 0;
+    loader->fbCount = fbCount;
+    loader->visibilityRange = visibilityRange;
+    loader->matrixFP = NULL;
+    loader->cacheCount = 0;
+    loader->mapRotY = 0.0f;
+
+    for (int i = 0; i < MAX_MAP_SEGMENTS; i++) {
+        loader->segments[i].model = NULL;
+        loader->segments[i].collision = NULL;
+        loader->segments[i].collisionChunkCount = 0;
+        for (int j = 0; j < MAX_COLLISION_CHUNKS; j++) {
+            loader->segments[i].collisionChunks[j] = NULL;
+        }
+        loader->segments[i].collisionOffX = 0.0f;
+        loader->segments[i].collisionOffZ = 0.0f;
+        loader->segments[i].collisionScaleX = 1.0f;
+        loader->segments[i].collisionScaleZ = 1.0f;
+        loader->segments[i].worldMinX = -99999.0f;
+        loader->segments[i].worldMaxX = 99999.0f;
+        loader->segments[i].isChunk = false;
+        loader->segments[i].loaded = false;
+        loader->segments[i].active = false;
+    }
+
+    for (int i = 0; i < MAX_CACHED_MODELS; i++) {
+        loader->modelCache[i].path = NULL;
+        loader->modelCache[i].model = NULL;
+    }
+}
+
+// Load maps in order - auto-align along -X axis
+// Collision is automatically looked up by model name
+static inline void maploader_load(MapLoader* loader, MapSegmentDef* defs, int count) {
+    if (count > MAX_MAP_SEGMENTS) count = MAX_MAP_SEGMENTS;
+
+    char nameBuffer[64];
+
+    for (int i = 0; i < count; i++) {
+        MapSegment* seg = &loader->segments[i];
+
+        // Load model (using cache)
+        seg->model = maploader_get_cached_model(loader, defs[i].modelPath);
+
+        // Set scale
+        seg->scaleX = defs[i].scaleX > 0 ? defs[i].scaleX : 1.0f;
+        seg->scaleY = defs[i].scaleY > 0 ? defs[i].scaleY : 1.0f;
+        seg->scaleZ = defs[i].scaleZ > 0 ? defs[i].scaleZ : 1.0f;
+
+        // Auto-lookup collision by model name
+        extract_model_name(defs[i].modelPath, nameBuffer, sizeof(nameBuffer));
+
+        // Check if this is a chunk segment (name contains "_chunk")
+        bool isChunkName = (strstr(nameBuffer, "_chunk") != NULL);
+
+        if (isChunkName) {
+            // For chunk segments, find the single matching collision chunk
+            seg->collision = collision_find_single_chunk(nameBuffer);
+            seg->collisionChunkCount = 0;  // Single mesh, not using chunk array
+            if (seg->collision) {
+                debugf("MapLoader: Found single chunk collision for %s (%d triangles)\n",
+                    nameBuffer, seg->collision->count);
+            } else {
+                debugf("MapLoader: No chunk collision found for %s\n", nameBuffer);
+            }
+        } else {
+            // For non-chunk segments, try chunked collision group first
+            seg->collisionChunkCount = collision_find_chunks(nameBuffer, seg->collisionChunks, MAX_COLLISION_CHUNKS);
+
+            if (seg->collisionChunkCount > 0) {
+                // Using chunked collision
+                seg->collision = NULL;
+                int totalTris = 0;
+                for (int c = 0; c < seg->collisionChunkCount; c++) {
+                    totalTris += seg->collisionChunks[c]->count;
+                }
+                debugf("MapLoader: Found %d collision chunks for %s (%d total triangles)\n",
+                    seg->collisionChunkCount, nameBuffer, totalTris);
+            } else {
+                // Fall back to single collision mesh
+                seg->collision = collision_find(nameBuffer);
+                if (seg->collision) {
+                    debugf("MapLoader: Found collision for %s (%d triangles)\n",
+                        nameBuffer, seg->collision->count);
+                } else {
+                    debugf("MapLoader: No collision found for %s\n", nameBuffer);
+                }
+            }
+        }
+
+        seg->loaded = true;
+
+        // Chunks are positioned at origin since they have world-space vertices
+        seg->isChunk = isChunkName;
+
+        // Calculate extents from model AABB
+        if (seg->model != NULL) {
+            debugf("MapLoader: %s AABB X[%d,%d] Y[%d,%d] Z[%d,%d]\n",
+                nameBuffer,
+                seg->model->aabbMin[0], seg->model->aabbMax[0],
+                seg->model->aabbMin[1], seg->model->aabbMax[1],
+                seg->model->aabbMin[2], seg->model->aabbMax[2]);
+
+            if (seg->isChunk) {
+                // Chunks have 0° effective rotation (rotY cancels base 90°)
+                // World X = model X directly (no rotation)
+                seg->extentMin = seg->model->aabbMin[0] * seg->scaleX;
+                seg->extentMax = seg->model->aabbMax[0] * seg->scaleX;
+            } else {
+                // Normal segments: 90° Y rotation - local Z becomes world -X
+                seg->extentMin = -seg->model->aabbMax[2] * seg->scaleZ;
+                seg->extentMax = -seg->model->aabbMin[2] * seg->scaleZ;
+            }
+            seg->width = seg->extentMax - seg->extentMin;
+            debugf("MapLoader: %s extents [%.1f, %.1f] width=%.1f\n",
+                nameBuffer, seg->extentMin, seg->extentMax, seg->width);
+        } else {
+            seg->extentMin = -50.0f;
+            seg->extentMax = 50.0f;
+            seg->width = 100.0f;
+        }
+
+        // Position segment so edges align properly
+        if (seg->isChunk) {
+            // Chunks are rendered at origin (no offset needed)
+            seg->posX = 0.0f;
+            seg->posY = 0.0f;
+            seg->posZ = 0.0f;
+            seg->rotY = 0.0f;  // No extra rotation beyond base 90°
+            debugf("MapLoader: [%d] %s is a chunk\n", i, nameBuffer);
+        } else if (i == 0) {
+            // First segment: position so right edge is at X=0
+            seg->posX = -seg->extentMax;
+            debugf("MapLoader: [%d] %s first segment, posX = -extentMax = %.1f\n",
+                i, nameBuffer, seg->posX);
+        } else {
+            // Subsequent segments: right edge touches previous left edge
+            MapSegment* prev = &loader->segments[i - 1];
+            float prevLeftEdge = prev->posX + prev->extentMin;
+            seg->posX = prevLeftEdge - seg->extentMax;
+            debugf("MapLoader: [%d] %s prev[%d] leftEdge=%.1f, posX = %.1f - %.1f = %.1f\n",
+                i, nameBuffer, i-1, prevLeftEdge, prevLeftEdge, seg->extentMax, seg->posX);
+        }
+        if (!seg->isChunk) {
+            seg->posY = 0.0f;
+            seg->posZ = 0.0f;
+        }
+
+        debugf("MapLoader: [%d] %s FINAL pos=(%.1f, %.1f, %.1f) edges=[%.1f, %.1f]\n",
+            i, nameBuffer, seg->posX, seg->posY, seg->posZ,
+            seg->posX + seg->extentMin, seg->posX + seg->extentMax);
+
+        // Build spatial grid now that we know the final position
+        // All segments use 90° rotation to match T3D coordinate system
+        float collisionRotY = T3D_DEG_TO_RAD(90.0f);
+
+        // Set collision offset and scale - same as visual for all segments (including chunks)
+        // Collision data is exported in the same coordinate space as visual models
+        seg->collisionOffX = seg->posX;
+        seg->collisionOffZ = seg->posZ;
+        seg->collisionScaleX = seg->scaleX;
+        seg->collisionScaleZ = seg->scaleZ;
+
+        if (seg->collisionChunkCount > 0) {
+            // Build grid for each chunk - use collision scale, not visual scale
+            for (int c = 0; c < seg->collisionChunkCount; c++) {
+                if (seg->collisionChunks[c] && seg->collisionChunks[c]->count > 0) {
+                    collision_build_spatial_grid(seg->collisionChunks[c], seg->collisionOffX, seg->collisionOffZ, seg->collisionScaleX, seg->collisionScaleZ, collisionRotY);
+                }
+            }
+            debugf("MapLoader: Built spatial grids for %d chunks with rot=%.1f deg, offset=%.1f, scale=%.2f\n", seg->collisionChunkCount, collisionRotY * 180.0f / 3.14159f, seg->collisionOffX, seg->collisionScaleX);
+        } else if (seg->collision && seg->collision->count > 0) {
+            collision_build_spatial_grid(seg->collision, seg->collisionOffX, seg->collisionOffZ, seg->collisionScaleX, seg->collisionScaleZ, collisionRotY);
+            debugf("MapLoader: Built spatial grid for %s (%d tris)\n", nameBuffer, seg->collision->count);
+        }
+    }
+
+    loader->count = count;
+
+    // Allocate matrices
+    if (loader->matrixFP != NULL) {
+        free_uncached(loader->matrixFP);
+    }
+    loader->matrixFP = malloc_uncached(sizeof(T3DMat4FP) * loader->fbCount * count);
+}
+
+// Convenience: load with default scale (1.0)
+static inline void maploader_load_simple(MapLoader* loader, const char* const* modelPaths, int count) {
+    MapSegmentDef defs[MAX_MAP_SEGMENTS];
+    for (int i = 0; i < count && i < MAX_MAP_SEGMENTS; i++) {
+        defs[i].modelPath = modelPaths[i];
+        defs[i].scaleX = 1.0f;
+        defs[i].scaleY = 1.0f;
+        defs[i].scaleZ = 1.0f;
+    }
+    maploader_load(loader, defs, count);
+}
+
+// Rebuild spatial grids with correct rotation (call after setting loader->mapRotY)
+// Uses loader->mapRotY as the extra rotation (set by level_load from LevelData.mapRotY)
+// Also computes world-space X bounds for visibility culling
+static inline void maploader_rebuild_collision_grids(MapLoader* loader) {
+    // Collision data is always in original model coordinates (not rotated)
+    // so it needs the base 90° rotation plus any level-specific extra rotation
+    float collisionRotY = T3D_DEG_TO_RAD(90.0f) + loader->mapRotY;
+    float cosR = fast_cos(collisionRotY);
+    float sinR = fast_sin(collisionRotY);
+
+    for (int i = 0; i < loader->count; i++) {
+        MapSegment* seg = &loader->segments[i];
+
+        // Reset world bounds
+        seg->worldMinX = 99999.0f;
+        seg->worldMaxX = -99999.0f;
+
+        if (seg->collisionChunkCount > 0) {
+            // Rebuild grid for each chunk - use collision scale, not visual scale
+            for (int c = 0; c < seg->collisionChunkCount; c++) {
+                CollisionMesh* chunk = seg->collisionChunks[c];
+                if (chunk && chunk->count > 0) {
+                    collision_build_spatial_grid(chunk, seg->collisionOffX, seg->collisionOffZ, seg->collisionScaleX, seg->collisionScaleZ, collisionRotY);
+
+                    // Compute world X bounds from this chunk's collision data
+                    for (int t = 0; t < chunk->count; t++) {
+                        CollisionTriangle* tri = &chunk->triangles[t];
+                        // Apply rotation and offset to get world X
+                        float x0 = (tri->x0 * cosR - tri->z0 * sinR) * seg->collisionScaleX + seg->collisionOffX;
+                        float x1 = (tri->x1 * cosR - tri->z1 * sinR) * seg->collisionScaleX + seg->collisionOffX;
+                        float x2 = (tri->x2 * cosR - tri->z2 * sinR) * seg->collisionScaleX + seg->collisionOffX;
+                        if (x0 < seg->worldMinX) seg->worldMinX = x0;
+                        if (x0 > seg->worldMaxX) seg->worldMaxX = x0;
+                        if (x1 < seg->worldMinX) seg->worldMinX = x1;
+                        if (x1 > seg->worldMaxX) seg->worldMaxX = x1;
+                        if (x2 < seg->worldMinX) seg->worldMinX = x2;
+                        if (x2 > seg->worldMaxX) seg->worldMaxX = x2;
+                    }
+                }
+            }
+            debugf("MapLoader: Segment %d rebuilt %d chunks, worldX=[%.1f, %.1f]\n",
+                i, seg->collisionChunkCount, seg->worldMinX, seg->worldMaxX);
+        } else if (seg->collision && seg->collision->count > 0) {
+            collision_build_spatial_grid(seg->collision, seg->collisionOffX, seg->collisionOffZ, seg->collisionScaleX, seg->collisionScaleZ, collisionRotY);
+
+            // Compute world X bounds from collision data
+            for (int t = 0; t < seg->collision->count; t++) {
+                CollisionTriangle* tri = &seg->collision->triangles[t];
+                float x0 = (tri->x0 * cosR - tri->z0 * sinR) * seg->collisionScaleX + seg->collisionOffX;
+                float x1 = (tri->x1 * cosR - tri->z1 * sinR) * seg->collisionScaleX + seg->collisionOffX;
+                float x2 = (tri->x2 * cosR - tri->z2 * sinR) * seg->collisionScaleX + seg->collisionOffX;
+                if (x0 < seg->worldMinX) seg->worldMinX = x0;
+                if (x0 > seg->worldMaxX) seg->worldMaxX = x0;
+                if (x1 < seg->worldMinX) seg->worldMinX = x1;
+                if (x1 > seg->worldMaxX) seg->worldMaxX = x1;
+                if (x2 < seg->worldMinX) seg->worldMinX = x2;
+                if (x2 > seg->worldMaxX) seg->worldMaxX = x2;
+            }
+            debugf("MapLoader: Segment %d rebuilt, worldX=[%.1f, %.1f]\n",
+                i, seg->worldMinX, seg->worldMaxX);
+        }
+    }
+}
+
+// Update visibility based on camera/player X position
+// Activates segments whose world X bounds overlap with player position (+/- margin)
+static inline void maploader_update_visibility(MapLoader* loader, float checkX) {
+    // Margin for pre-loading nearby chunks (larger = more visible at once)
+    float visMargin = loader->visibilityRange;
+
+    for (int i = 0; i < loader->count; i++) {
+        MapSegment* seg = &loader->segments[i];
+        if (!seg->loaded) continue;
+
+        bool wasActive = seg->active;
+
+        // Check if player X is within this segment's world bounds (with margin)
+        // Segment is active if: checkX is within [worldMinX - margin, worldMaxX + margin]
+        if (checkX >= seg->worldMinX - visMargin && checkX <= seg->worldMaxX + visMargin) {
+            seg->active = true;
+            if (!wasActive) {
+                debugf("%.1f = Chunk %d LOADED (bounds: %.0f to %.0f)\n", checkX, i, seg->worldMinX, seg->worldMaxX);
+            }
+        } else {
+            seg->active = false;
+            if (wasActive) {
+                debugf("%.1f = Chunk %d UNLOADED (bounds: %.0f to %.0f)\n", checkX, i, seg->worldMinX, seg->worldMaxX);
+            }
+        }
+    }
+}
+
+// Helper: Check if segment has any collision (single or chunks)
+static inline bool maploader_segment_has_collision(MapSegment* seg) {
+    if (seg->collisionChunkCount > 0) return true;
+    return (seg->collision != NULL && seg->collision->count > 0);
+}
+
+// Get ground height at position (with automatic rotation to match visuals)
+static inline float maploader_get_ground_height(MapLoader* loader, float px, float py, float pz) {
+    float bestY = -9999.0f;
+
+    for (int i = 0; i < loader->count; i++) {
+        MapSegment* seg = &loader->segments[i];
+        if (!seg->active || !maploader_segment_has_collision(seg)) continue;
+
+        // Note: Removed X-bounds early-out check - it doesn't work correctly
+        // with rotated chunked maps. The spatial grid handles culling efficiently.
+
+        // Check collision chunks if available - use collision scale, not visual scale
+        if (seg->collisionChunkCount > 0) {
+            for (int c = 0; c < seg->collisionChunkCount; c++) {
+                CollisionMesh* chunk = seg->collisionChunks[c];
+                if (!chunk || chunk->count == 0) continue;
+
+                float groundY = collision_get_ground_height_scaled(
+                    chunk, px, py, pz,
+                    seg->collisionOffX, seg->posY, seg->collisionOffZ,
+                    seg->collisionScaleX, seg->scaleY, seg->collisionScaleZ
+                );
+                if (groundY > bestY) bestY = groundY;
+            }
+        } else if (seg->collision) {
+            // Single collision mesh
+            float groundY = collision_get_ground_height_scaled(
+                seg->collision, px, py, pz,
+                seg->collisionOffX, seg->posY, seg->collisionOffZ,
+                seg->collisionScaleX, seg->scaleY, seg->collisionScaleZ
+            );
+            if (groundY > bestY) bestY = groundY;
+        }
+    }
+
+    return bestY;
+}
+
+// Get ground height AND normal at position (for shadow projection)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
+static inline float maploader_get_ground_height_normal(MapLoader* loader, float px, float py, float pz,
+    float* outNX, float* outNY, float* outNZ) {
+    float bestY = -9999.0f;
+    *outNX = 0.0f; *outNY = 1.0f; *outNZ = 0.0f;  // Default: up
+
+    for (int i = 0; i < loader->count; i++) {
+        MapSegment* seg = &loader->segments[i];
+        if (!seg->active || !maploader_segment_has_collision(seg)) continue;
+
+        // Check collision chunks if available - use collision scale, not visual scale
+        if (seg->collisionChunkCount > 0) {
+            for (int c = 0; c < seg->collisionChunkCount; c++) {
+                CollisionMesh* chunk = seg->collisionChunks[c];
+                if (!chunk || chunk->count == 0) continue;
+
+                float nx, ny, nz;
+                float groundY = collision_get_ground_height_normal(
+                    chunk, px, py, pz,
+                    seg->collisionOffX, seg->posY, seg->collisionOffZ,
+                    seg->collisionScaleX, seg->scaleY, seg->collisionScaleZ,
+                    &nx, &ny, &nz
+                );
+                if (groundY > bestY) {
+                    bestY = groundY;
+                    *outNX = nx; *outNY = ny; *outNZ = nz;
+                }
+            }
+        } else if (seg->collision) {
+            float nx, ny, nz;
+            float groundY = collision_get_ground_height_normal(
+                seg->collision, px, py, pz,
+                seg->collisionOffX, seg->posY, seg->collisionOffZ,
+                seg->collisionScaleX, seg->scaleY, seg->collisionScaleZ,
+                &nx, &ny, &nz
+            );
+            if (groundY > bestY) {
+                bestY = groundY;
+                *outNX = nx; *outNY = ny; *outNZ = nz;
+            }
+        }
+    }
+
+    return bestY;
+}
+#pragma GCC diagnostic pop
+
+// Check wall collision (extended version with ground height for slope handling)
+static inline bool maploader_check_walls_ex(MapLoader* loader,
+    float px, float py, float pz, float radius, float playerHeight,
+    float* outPushX, float* outPushZ, float playerGroundY) {
+
+    *outPushX = 0.0f;
+    *outPushZ = 0.0f;
+    bool collided = false;
+
+    for (int i = 0; i < loader->count; i++) {
+        MapSegment* seg = &loader->segments[i];
+        if (!seg->active || !maploader_segment_has_collision(seg)) continue;
+
+        // Check collision chunks if available - use collision scale, not visual scale
+        if (seg->collisionChunkCount > 0) {
+            for (int c = 0; c < seg->collisionChunkCount; c++) {
+                CollisionMesh* chunk = seg->collisionChunks[c];
+                if (!chunk || chunk->count == 0) continue;
+
+                float pushX = 0.0f, pushZ = 0.0f;
+                if (collision_check_walls_ex(chunk,
+                    px, py, pz, radius, playerHeight,
+                    seg->collisionOffX, seg->posY, seg->collisionOffZ,
+                    seg->collisionScaleX, seg->scaleY, seg->collisionScaleZ,
+                    &pushX, &pushZ, playerGroundY)) {
+                    *outPushX += pushX;
+                    *outPushZ += pushZ;
+                    collided = true;
+                }
+            }
+        } else if (seg->collision) {
+            float pushX = 0.0f, pushZ = 0.0f;
+            if (collision_check_walls_ex(seg->collision,
+                px, py, pz, radius, playerHeight,
+                seg->collisionOffX, seg->posY, seg->collisionOffZ,
+                seg->collisionScaleX, seg->scaleY, seg->collisionScaleZ,
+                &pushX, &pushZ, playerGroundY)) {
+                *outPushX += pushX;
+                *outPushZ += pushZ;
+                collided = true;
+            }
+        }
+    }
+
+    return collided;
+}
+
+// Check wall collision (backwards compatible - no ground height)
+static inline bool maploader_check_walls(MapLoader* loader,
+    float px, float py, float pz, float radius, float playerHeight,
+    float* outPushX, float* outPushZ) {
+    return maploader_check_walls_ex(loader, px, py, pz, radius, playerHeight,
+        outPushX, outPushZ, INVALID_GROUND_Y);
+}
+
+// Check if line of sight is blocked by map geometry (for decal occlusion)
+static inline bool maploader_raycast_blocked(MapLoader* loader,
+    float fromX, float fromY, float fromZ,
+    float toX, float toY, float toZ) {
+
+    for (int i = 0; i < loader->count; i++) {
+        MapSegment* seg = &loader->segments[i];
+        if (!seg->active || !maploader_segment_has_collision(seg)) continue;
+
+        // Check collision chunks if available - use collision scale, not visual scale
+        if (seg->collisionChunkCount > 0) {
+            for (int c = 0; c < seg->collisionChunkCount; c++) {
+                CollisionMesh* chunk = seg->collisionChunks[c];
+                if (!chunk) continue;
+
+                if (collision_raycast_blocked(chunk,
+                    fromX, fromY, fromZ, toX, toY, toZ,
+                    seg->collisionOffX, seg->collisionOffZ, seg->collisionScaleX, seg->collisionScaleZ)) {
+                    return true;
+                }
+            }
+        } else if (seg->collision) {
+            if (collision_raycast_blocked(seg->collision,
+                fromX, fromY, fromZ, toX, toY, toZ,
+                seg->collisionOffX, seg->collisionOffZ, seg->collisionScaleX, seg->collisionScaleZ)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Filter callback for frustum culling - only draw visible objects
+static bool maploader_frustum_filter(void* userData, const T3DObject *obj) {
+    (void)userData;
+    return obj->isVisible;
+}
+
+// Draw all active maps with frustum culling
+static inline void maploader_draw_culled(MapLoader* loader, int frameIdx, T3DViewport* viewport) {
+    for (int i = 0; i < loader->count; i++) {
+        MapSegment* seg = &loader->segments[i];
+        if (!seg->active || seg->model == NULL) continue;
+
+        int matIdx = frameIdx * loader->count + i;
+        // All segments need base 90° + level rotation (same as collision)
+        float totalRotY = T3D_DEG_TO_RAD(90.0f) + seg->rotY;
+        t3d_mat4fp_from_srt_euler(&loader->matrixFP[matIdx],
+            (float[3]){seg->scaleX, seg->scaleY, seg->scaleZ},
+            (float[3]){0.0f, totalRotY, 0.0f},
+            (float[3]){seg->posX, seg->posY, seg->posZ}
+        );
+
+        // Check if model has BVH for frustum culling
+        const T3DBvh* bvh = t3d_model_bvh_get(seg->model);
+        if (bvh && viewport) {
+            // Reset visibility on all objects
+            T3DModelIter it = t3d_model_iter_create(seg->model, T3D_CHUNK_TYPE_OBJECT);
+            while (t3d_model_iter_next(&it)) {
+                it.object->isVisible = false;
+            }
+
+            // Create model-view-projection matrix for frustum in model space
+            // Model matrix: SRT with rotation and translation
+            T3DMat4 modelMat, mvpMat;
+            t3d_mat4_from_srt_euler(&modelMat,
+                (float[3]){seg->scaleX, seg->scaleY, seg->scaleZ},
+                (float[3]){0.0f, totalRotY, 0.0f},
+                (float[3]){seg->posX, seg->posY, seg->posZ}
+            );
+
+            // Combine: MVP = Proj * View * Model
+            T3DMat4 vmMat;
+            t3d_mat4_mul(&vmMat, &viewport->matCamera, &modelMat);
+            t3d_mat4_mul(&mvpMat, &viewport->matProj, &vmMat);
+
+            // Extract frustum from MVP (this gives frustum in model space)
+            T3DFrustum modelFrustum;
+            t3d_mat4_to_frustum(&modelFrustum, &mvpMat);
+
+            // Query BVH with model-space frustum
+            t3d_model_bvh_query_frustum(bvh, &modelFrustum);
+
+            // Draw with filter
+            t3d_matrix_push(&loader->matrixFP[matIdx]);
+            t3d_model_draw_custom(seg->model, (T3DModelDrawConf){
+                .filterCb = maploader_frustum_filter
+            });
+            t3d_matrix_pop(1);
+        } else {
+            // No BVH, draw normally
+            t3d_matrix_push(&loader->matrixFP[matIdx]);
+            t3d_model_draw(seg->model);
+            t3d_matrix_pop(1);
+        }
+    }
+}
+
+// Draw all active maps (no frustum culling - legacy)
+static inline void maploader_draw(MapLoader* loader, int frameIdx) {
+    for (int i = 0; i < loader->count; i++) {
+        MapSegment* seg = &loader->segments[i];
+        if (!seg->active || seg->model == NULL) continue;
+
+        int matIdx = frameIdx * loader->count + i;
+        // All segments need base 90° rotation + any extra level rotation
+        float totalRotY = T3D_DEG_TO_RAD(90.0f) + seg->rotY;
+        t3d_mat4fp_from_srt_euler(&loader->matrixFP[matIdx],
+            (float[3]){seg->scaleX, seg->scaleY, seg->scaleZ},
+            (float[3]){0.0f, totalRotY, 0.0f},
+            (float[3]){seg->posX, seg->posY, seg->posZ}
+        );
+
+        t3d_matrix_push(&loader->matrixFP[matIdx]);
+        t3d_model_draw(seg->model);
+        t3d_matrix_pop(1);
+    }
+}
+
+// Get total vertex count of active segments
+static inline int maploader_get_active_verts(MapLoader* loader) {
+    int total = 0;
+    for (int i = 0; i < loader->count; i++) {
+        MapSegment* seg = &loader->segments[i];
+        if (seg->active && seg->model != NULL) {
+            total += seg->model->totalVertCount;
+        }
+    }
+    return total;
+}
+
+// Cleanup
+static inline void maploader_free(MapLoader* loader) {
+    // Free cached models (each only once)
+    for (int i = 0; i < loader->cacheCount; i++) {
+        if (loader->modelCache[i].model) {
+            t3d_model_free(loader->modelCache[i].model);
+            loader->modelCache[i].model = NULL;
+        }
+    }
+    loader->cacheCount = 0;
+
+    // Clear segments
+    for (int i = 0; i < loader->count; i++) {
+        loader->segments[i].model = NULL;
+        loader->segments[i].collision = NULL;
+    }
+
+    if (loader->matrixFP != NULL) {
+        free_uncached(loader->matrixFP);
+        loader->matrixFP = NULL;
+    }
+
+    loader->count = 0;
+}
+
+#endif // MAP_LOADER_H

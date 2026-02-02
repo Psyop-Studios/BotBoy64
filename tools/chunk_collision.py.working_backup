@@ -1,0 +1,229 @@
+#!/usr/bin/env python3
+"""
+Chunks large collision meshes into smaller pieces for better spatial grid performance.
+Run this BEFORE generate_collision_registry.py in the build process.
+"""
+
+import os
+import re
+import glob
+import math
+
+MODELS_DIR = "src/models"
+FILESYSTEM_DIR = "filesystem"
+CHUNK_THRESHOLD = 250  # Split meshes with more triangles than this
+MAX_TRIS_PER_CHUNK = 150  # Target triangles per chunk (keep under 192 cell limit)
+
+# Don't chunk these - they use full rotation collision which doesn't use spatial grid
+EXCLUDE_FROM_CHUNKING = ['cog', 'barrel', 'bolt', 'slime', 'spikes']
+
+
+def get_visual_chunk_count(model_name):
+    """Count how many visual chunks exist for a model in assets/ (GLB files from chunk_glb.py)."""
+    # Look at assets/ for .glb files since t3dm files aren't created until after codegen
+    pattern = os.path.join("assets", f"{model_name}_chunk*.glb")
+    chunk_files = glob.glob(pattern)
+    return len(chunk_files)
+
+def parse_collision_file(filepath):
+    """Parse a collision .h file and extract triangles."""
+    with open(filepath, 'r') as f:
+        content = f.read()
+
+    # Extract model name from header comment
+    name_match = re.search(r'// Model: (\w+)', content)
+    model_name = name_match.group(1) if name_match else None
+
+    # Extract triangle count
+    count_match = re.search(r'// Triangles: (\d+)', content)
+    tri_count = int(count_match.group(1)) if count_match else 0
+
+    # Extract variable names
+    array_match = re.search(r'static CollisionTriangle (\w+)\[\]', content)
+    mesh_match = re.search(r'static CollisionMesh (\w+)\s*=', content)
+
+    array_name = array_match.group(1) if array_match else None
+    mesh_name = mesh_match.group(1) if mesh_match else None
+
+    # Parse triangles: { x0, y0, z0,  x1, y1, z1,  x2, y2, z2 }
+    triangles = []
+    tri_pattern = r'\{\s*([-\d.]+)f?,\s*([-\d.]+)f?,\s*([-\d.]+)f?,\s*([-\d.]+)f?,\s*([-\d.]+)f?,\s*([-\d.]+)f?,\s*([-\d.]+)f?,\s*([-\d.]+)f?,\s*([-\d.]+)f?\s*\}'
+
+    for match in re.finditer(tri_pattern, content):
+        tri = tuple(float(match.group(i)) for i in range(1, 10))
+        triangles.append(tri)
+
+    return {
+        'model_name': model_name,
+        'tri_count': tri_count,
+        'array_name': array_name,
+        'mesh_name': mesh_name,
+        'triangles': triangles,
+    }
+
+def get_triangle_centroid_x(tri):
+    """Get the X centroid of a triangle (used for chunking along X axis)."""
+    # tri = (x0, y0, z0, x1, y1, z1, x2, y2, z2)
+    return (tri[0] + tri[3] + tri[6]) / 3.0
+
+def chunk_triangles(triangles, max_per_chunk, target_chunk_count=None):
+    """Split triangles into chunks based on X position (matches visual chunk_glb.py).
+
+    If target_chunk_count is provided, use exactly that many chunks to match visual chunks.
+    """
+    if len(triangles) <= max_per_chunk and target_chunk_count is None:
+        return [triangles]
+
+    # Sort by X centroid (same as visual chunker)
+    sorted_tris = sorted(triangles, key=get_triangle_centroid_x)
+
+    # Calculate number of chunks needed
+    if target_chunk_count and target_chunk_count > 0:
+        num_chunks = target_chunk_count
+    else:
+        num_chunks = math.ceil(len(sorted_tris) / max_per_chunk)
+
+    chunk_size = math.ceil(len(sorted_tris) / num_chunks)
+
+    chunks = []
+    for i in range(num_chunks):
+        start = i * chunk_size
+        end = min(start + chunk_size, len(sorted_tris))
+        if start < len(sorted_tris):  # Make sure we have triangles for this chunk
+            chunks.append(sorted_tris[start:end])
+
+    return chunks
+
+def write_chunk_file(filepath, model_name, chunk_idx, triangles):
+    """Write a collision chunk file."""
+    chunk_name = f"{model_name}_chunk{chunk_idx}"
+    array_name = f"{chunk_name}_collision_triangles"
+    mesh_name = f"{chunk_name}_collision"
+
+    # Format triangles
+    tri_lines = []
+    for tri in triangles:
+        tri_lines.append(f"    {{ {tri[0]:.1f}f, {tri[1]:.1f}f, {tri[2]:.1f}f,   {tri[3]:.1f}f, {tri[4]:.1f}f, {tri[5]:.1f}f,   {tri[6]:.1f}f, {tri[7]:.1f}f, {tri[8]:.1f}f }},")
+
+    content = f'''// N64 Collision Data - Auto-chunked by chunk_collision.py
+// Original Model: {model_name}
+// Chunk: {chunk_idx}
+// Triangles: {len(triangles)}
+
+#ifndef {chunk_name.upper()}_COLLISION_H
+#define {chunk_name.upper()}_COLLISION_H
+
+#include "../collision.h"
+
+static CollisionTriangle {array_name}[] = {{
+{chr(10).join(tri_lines)}
+}};
+
+static CollisionMesh {mesh_name} = {{
+    .triangles = {array_name},
+    .count = {len(triangles)},
+}};
+
+#endif // {chunk_name.upper()}_COLLISION_H
+'''
+
+    with open(filepath, 'w') as f:
+        f.write(content)
+
+    return chunk_name
+
+def write_chunk_index(filepath, model_name, chunk_names):
+    """Write a chunk index file that lists all chunks for a model."""
+    index_name = f"{model_name}_chunks"
+
+    chunk_refs = ', '.join(f'"{name}"' for name in chunk_names)
+
+    content = f'''// N64 Collision Chunk Index - Auto-generated by chunk_collision.py
+// Model: {model_name}
+// Chunks: {len(chunk_names)}
+
+#ifndef {index_name.upper()}_H
+#define {index_name.upper()}_H
+
+#define {model_name.upper()}_CHUNK_COUNT {len(chunk_names)}
+static const char* {index_name}[] = {{ {chunk_refs} }};
+
+#endif // {index_name.upper()}_H
+'''
+
+    with open(filepath, 'w') as f:
+        f.write(content)
+
+def main():
+    # Find all collision files
+    pattern = os.path.join(MODELS_DIR, "*_collision.h")
+    collision_files = sorted(glob.glob(pattern))
+
+    chunked_models = []
+
+    for filepath in collision_files:
+        filename = os.path.basename(filepath)
+
+        # Skip already-chunked files
+        if '_chunk' in filename:
+            continue
+
+        data = parse_collision_file(filepath)
+
+        if not data['triangles']:
+            continue
+
+        model_name = data['model_name'] or filename.replace('_collision.h', '')
+
+        # Skip excluded models (decorations that use full rotation)
+        if model_name in EXCLUDE_FROM_CHUNKING:
+            continue
+
+        # Check how many visual chunks exist for this model
+        visual_chunk_count = get_visual_chunk_count(model_name)
+
+        # Check if we need to chunk
+        if len(data['triangles']) <= CHUNK_THRESHOLD and visual_chunk_count == 0:
+            continue
+
+        # Use visual chunk count if available, otherwise calculate from triangle count
+        if visual_chunk_count > 0:
+            print(f"Chunking {model_name}: {len(data['triangles'])} triangles -> {visual_chunk_count} chunks (matching visual)")
+            chunks = chunk_triangles(data['triangles'], MAX_TRIS_PER_CHUNK, visual_chunk_count)
+        else:
+            print(f"Chunking {model_name}: {len(data['triangles'])} triangles")
+            chunks = chunk_triangles(data['triangles'], MAX_TRIS_PER_CHUNK)
+
+        # Write chunk files
+        chunk_names = []
+        for i, chunk_tris in enumerate(chunks):
+            chunk_filepath = os.path.join(MODELS_DIR, f"{model_name}_chunk{i}_collision.h")
+            chunk_name = write_chunk_file(chunk_filepath, model_name, i, chunk_tris)
+            chunk_names.append(chunk_name)
+            print(f"  -> {chunk_name}: {len(chunk_tris)} triangles")
+
+        # Write chunk index
+        index_filepath = os.path.join(MODELS_DIR, f"{model_name}_chunks.h")
+        write_chunk_index(index_filepath, model_name, chunk_names)
+
+        chunked_models.append({
+            'name': model_name,
+            'chunks': chunk_names,
+            'original_count': len(data['triangles']),
+        })
+
+        # Rename original file to .bak (keep it for reference)
+        backup_path = filepath + '.original'
+        if not os.path.exists(backup_path):
+            os.rename(filepath, backup_path)
+            print(f"  -> Original backed up to {os.path.basename(backup_path)}")
+
+    if chunked_models:
+        print(f"\nChunked {len(chunked_models)} collision mesh(es)")
+        for m in chunked_models:
+            print(f"  {m['name']}: {m['original_count']} tris -> {len(m['chunks'])} chunks")
+    else:
+        print("No collision meshes needed chunking")
+
+if __name__ == "__main__":
+    main()

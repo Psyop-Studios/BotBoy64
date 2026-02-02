@@ -1,0 +1,13 @@
+extern Lights1 Cartridge_f3dlite_material_001_lights;
+extern u64 Cartridge_stickr_rgba16[];
+extern u64 Cartridge_cartridge_gray_ci4[];
+extern u64 Cartridge_cartridge_gray_pal_rgba16[];
+extern Vtx Cartridge_Cube_mesh_vtx_0[6];
+extern Gfx Cartridge_Cube_mesh_tri_0[];
+extern Vtx Cartridge_Cube_mesh_vtx_1[246];
+extern Gfx Cartridge_Cube_mesh_tri_1[];
+extern Gfx mat_Cartridge_f3dlite_material_001[];
+extern Gfx mat_revert_Cartridge_f3dlite_material_001[];
+extern Gfx mat_Cartridge_f3dlite_material_002[];
+extern Gfx mat_revert_Cartridge_f3dlite_material_002[];
+extern Gfx Cartridge_Cube_mesh[];
