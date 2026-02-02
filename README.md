@@ -1,11 +1,7 @@
 
   ![BotBoy!64](assets/banner.png)
 
-  Or for more control over sizing, use HTML:
 
-  <p align="center">
-    <img src="assets/banner.png" alt="BotBoy!64" width="100%">
-  </p>
 
 # BotBoy!64
 
